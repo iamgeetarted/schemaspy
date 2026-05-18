@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schemaspy"
+version = "1.0.0"
+description = "SQLite schema explorer with AI documentation generation and semantic search"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "iamgeetarted", email = "marktimothydorsey@gmail.com"}]
+keywords = ["sqlite", "schema", "database", "ai", "cli", "rich", "documentation"]
+dependencies = [
+    "rich>=12.0",
+    "anthropic>=0.20.0",
+]
+
+[project.scripts]
+schemaspy = "schemaspy.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/iamgeetarted/schemaspy"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
