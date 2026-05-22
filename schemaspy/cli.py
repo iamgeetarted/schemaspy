@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import os
 import sys
 
@@ -237,6 +239,259 @@ def cmd_issues(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sub-command: profile
+# ---------------------------------------------------------------------------
+
+def cmd_profile(args: argparse.Namespace) -> None:
+    """Profile column statistics for one or all tables in a SQLite database."""
+    from schemaspy.analyzer import analyze_schema
+    from schemaspy.profiler import ColumnProfile, profile_database, profile_table
+
+    _require_db(args.db)
+
+    with console.status("[cyan]Analyzing schema…[/cyan]"):
+        report = analyze_schema(args.db)
+
+    # Filter to requested table if --table given
+    tables = report.tables
+    if args.table:
+        tables = [t for t in tables if t.name == args.table]
+        if not tables:
+            console.print(f"[red]Error:[/red] Table '{args.table}' not found in database.")
+            sys.exit(1)
+
+    async def _collect() -> dict[str, list[ColumnProfile]]:
+        tasks = [
+            asyncio.to_thread(profile_table, args.db, t) for t in tables
+        ]
+        results = await asyncio.gather(*tasks)
+        return {t.name: profiles for t, profiles in zip(tables, results)}
+
+    with console.status("[cyan]Profiling columns…[/cyan]"):
+        all_profiles = asyncio.run(_collect())
+
+    # Flatten for output
+    flat: list[ColumnProfile] = []
+    for t in tables:
+        flat.extend(all_profiles.get(t.name, []))
+
+    fmt = (args.format or "table").lower()
+
+    # ── JSON ─────────────────────────────────────────────────────────────────
+    if fmt == "json":
+        import dataclasses
+        console.print(json.dumps([dataclasses.asdict(p) for p in flat], indent=2))
+        return
+
+    # ── Markdown ─────────────────────────────────────────────────────────────
+    if fmt == "markdown":
+        header = "| Table | Column | Type | Rows | Null% | Distinct | Min | Max | Sample |"
+        sep    = "|-------|--------|------|------|-------|----------|-----|-----|--------|"
+        lines = [header, sep]
+        for p in flat:
+            sample = ", ".join(p.sample_vals[:3])
+            lines.append(
+                f"| {p.table_name} | {p.col_name} | {p.col_type} "
+                f"| {p.row_count} | {p.null_pct:.1f}% | {p.distinct_count} "
+                f"| {p.min_val or ''} | {p.max_val or ''} | {sample} |"
+            )
+        console.print("\n".join(lines))
+        return
+
+    # ── Rich table (default) ─────────────────────────────────────────────────
+    tbl = Table(
+        title=f"[bold]Column Profiles: {args.db}[/bold]",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    tbl.add_column("Table", style="cyan", no_wrap=True)
+    tbl.add_column("Column", style="bold")
+    tbl.add_column("Type", style="dim")
+    tbl.add_column("Rows", justify="right")
+    tbl.add_column("Null%", justify="right")
+    tbl.add_column("Distinct", justify="right")
+    tbl.add_column("Min")
+    tbl.add_column("Max")
+    tbl.add_column("Sample")
+
+    for p in flat:
+        null_style = "red" if p.null_pct > 50 else ("yellow" if p.null_pct > 0 else "green")
+        tbl.add_row(
+            p.table_name,
+            p.col_name,
+            p.col_type,
+            str(p.row_count),
+            Text(f"{p.null_pct:.1f}%", style=null_style),
+            str(p.distinct_count),
+            p.min_val or "[dim]—[/dim]",
+            p.max_val or "[dim]—[/dim]",
+            ", ".join(p.sample_vals[:3]) or "[dim]—[/dim]",
+        )
+
+    console.print(tbl)
+
+
+# ---------------------------------------------------------------------------
+# Sub-command: diff
+# ---------------------------------------------------------------------------
+
+def cmd_diff(args: argparse.Namespace) -> None:
+    """Show structural differences between two SQLite database schemas."""
+    from schemaspy.analyzer import analyze_schema
+    from schemaspy.differ import diff_schemas
+
+    _require_db(args.old_db)
+    _require_db(args.new_db)
+
+    with console.status("[cyan]Analyzing schemas…[/cyan]"):
+        old_report = analyze_schema(args.old_db)
+        new_report = analyze_schema(args.new_db)
+
+    diff = diff_schemas(old_report, new_report)
+
+    if not diff.has_changes:
+        console.print("[green]✓ Schemas are identical — no differences found.[/green]")
+        sys.exit(0)
+
+    # ── Added tables ─────────────────────────────────────────────────────────
+    if diff.added_tables:
+        console.print()
+        console.print("[bold green]Added tables:[/bold green]")
+        for name in diff.added_tables:
+            console.print(f"  [green]+ {name}[/green]")
+
+    # ── Removed tables ────────────────────────────────────────────────────────
+    if diff.removed_tables:
+        console.print()
+        console.print("[bold red]Removed tables:[/bold red]")
+        for name in diff.removed_tables:
+            console.print(f"  [red]- {name}[/red]")
+
+    # ── Changed tables ────────────────────────────────────────────────────────
+    if diff.changed_tables:
+        console.print()
+        console.print("[bold yellow]Changed tables:[/bold yellow]")
+        for table_name, changes in diff.changed_tables.items():
+            console.print(f"\n  [cyan]{table_name}[/cyan]")
+            for col in changes.added_columns:
+                console.print(f"    [green]+ column: {col}[/green]")
+            for col in changes.removed_columns:
+                console.print(f"    [red]- column: {col}[/red]")
+            for col, (old_type, new_type) in changes.type_changes.items():
+                console.print(
+                    f"    [yellow]~ column: {col}  "
+                    f"[dim]{old_type}[/dim] → [bold]{new_type}[/bold][/yellow]"
+                )
+
+    console.print()
+    # Exit 1 so CI pipelines can detect schema drift
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Sub-command: query (natural language → SQL via Claude)
+# ---------------------------------------------------------------------------
+
+def cmd_query(args: argparse.Namespace) -> None:
+    """Generate SQL from a natural-language question using Claude, optionally execute it."""
+    from schemaspy.analyzer import analyze_schema
+
+    _require_db(args.db)
+
+    with console.status("[cyan]Analyzing schema…[/cyan]"):
+        report = analyze_schema(args.db)
+
+    # Build a schema context string for the prompt
+    schema_lines: list[str] = []
+    for table in report.tables:
+        col_defs = ", ".join(
+            f"{c.name} {c.type}" for c in table.columns
+        )
+        schema_lines.append(f"  {table.name}({col_defs})")
+        for fk in table.foreign_keys:
+            schema_lines.append(
+                f"    -- FK: {table.name}.{fk.column} → {fk.ref_table}.{fk.ref_column}"
+            )
+
+    schema_context = "\n".join(schema_lines)
+
+    prompt = (
+        "You are a SQLite expert. Given the schema below, write a single valid SQLite SQL "
+        "query that answers the question. Output ONLY the raw SQL with no markdown fences, "
+        "no explanation, and no trailing semicolon unless required by syntax.\n\n"
+        f"Schema:\n{schema_context}\n\n"
+        f"Question: {args.question}"
+    )
+
+    client = _get_ai_client()
+
+    # Lazy import anthropic inside function
+    import anthropic  # type: ignore[import]
+
+    sql_text = ""
+
+    with Live(console=console, refresh_per_second=8) as live:
+        live.update(Panel("[cyan]Generating SQL…[/cyan]", border_style="cyan"))
+        with client.messages.stream(  # type: ignore[attr-defined]
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            for chunk in stream.text_stream:
+                sql_text += chunk
+                live.update(
+                    Panel(
+                        sql_text,
+                        title="[bold cyan]Generated SQL[/bold cyan]",
+                        border_style="cyan",
+                    )
+                )
+        live.update(
+            Panel(
+                sql_text,
+                title="[bold green]Generated SQL[/bold green]",
+                border_style="green",
+            )
+        )
+
+    console.print()
+
+    # ── Execute ──────────────────────────────────────────────────────────────
+    if args.execute:
+        import sqlite3
+
+        sql_to_run = sql_text.strip()
+        # Append LIMIT if not already present and user specified one
+        if args.limit and "limit" not in sql_to_run.lower():
+            sql_to_run = f"{sql_to_run} LIMIT {args.limit}"
+
+        try:
+            con = sqlite3.connect(args.db)
+            try:
+                cur = con.execute(sql_to_run)
+                rows = cur.fetchall()
+                col_names = [desc[0] for desc in cur.description] if cur.description else []
+            finally:
+                con.close()
+        except sqlite3.Error as exc:
+            console.print(f"[red]SQL Error:[/red] {exc}")
+            sys.exit(1)
+
+        result_tbl = Table(
+            title=f"[bold]Query Results[/bold] ({len(rows)} row{'s' if len(rows) != 1 else ''})",
+            show_header=True,
+            header_style="bold magenta",
+        )
+        for col_name in col_names:
+            result_tbl.add_column(col_name)
+
+        for row in rows:
+            result_tbl.add_row(*[str(v) if v is not None else "[dim]NULL[/dim]" for v in row])
+
+        console.print(result_tbl)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -245,7 +500,7 @@ def main() -> None:
         prog="schemaspy",
         description="SQLite schema explorer with AI documentation and semantic search",
     )
-    parser.add_argument("--version", action="version", version="schemaspy 1.0.0")
+    parser.add_argument("--version", action="version", version="schemaspy 1.3.0")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -269,12 +524,46 @@ def main() -> None:
     p_issues.add_argument("db", metavar="DB", help="Path to SQLite database file")
     p_issues.add_argument("--ai", action="store_true", help="Generate AI explanation of issues")
 
+    # profile
+    p_profile = sub.add_parser("profile", help="Profile column statistics for a database")
+    p_profile.add_argument("db", metavar="DB", help="Path to SQLite database file")
+    p_profile.add_argument("--table", metavar="TABLE", help="Limit profiling to a single table")
+    p_profile.add_argument(
+        "--format",
+        choices=["json", "markdown", "table"],
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # diff
+    p_diff = sub.add_parser("diff", help="Show structural differences between two schemas")
+    p_diff.add_argument("old_db", metavar="OLD_DB", help="Path to the old SQLite database file")
+    p_diff.add_argument("new_db", metavar="NEW_DB", help="Path to the new SQLite database file")
+
+    # query
+    p_query = sub.add_parser("query", help="Generate SQL from a natural-language question")
+    p_query.add_argument("db", metavar="DB", help="Path to SQLite database file")
+    p_query.add_argument("question", metavar="QUESTION", help="Natural-language question")
+    p_query.add_argument(
+        "--execute", action="store_true", help="Execute the generated SQL and display results"
+    )
+    p_query.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Append LIMIT N to the generated query before executing",
+    )
+
     args = parser.parse_args()
 
     dispatch = {
         "inspect": cmd_inspect,
         "similar": cmd_similar,
         "issues": cmd_issues,
+        "profile": cmd_profile,
+        "diff": cmd_diff,
+        "query": cmd_query,
     }
     dispatch[args.command](args)
 

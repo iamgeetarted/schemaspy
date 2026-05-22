@@ -1,3 +1,52 @@
+## What's New in v1.3
+
+### Feature 1 — Data Profiling (`schemaspy profile`)
+
+Profile every column in a database: null counts, distinct counts, min/max values, and sample data — all computed with pure SQL, no extra dependencies.
+
+```bash
+# Profile all tables (Rich table output)
+schemaspy profile myapp.db
+
+# Profile a single table
+schemaspy profile myapp.db --table users
+
+# Export as JSON or Markdown
+schemaspy profile myapp.db --format json
+schemaspy profile myapp.db --format markdown
+```
+
+Output columns: **Table · Column · Type · Rows · Null% · Distinct · Min · Max · Sample**
+
+---
+
+### Feature 2 — Schema Diff (`schemaspy diff`)
+
+Compare two SQLite databases and surface every structural change: added/removed tables, added/removed columns, and column type changes. Exits with code 1 when differences are found, making it CI-friendly.
+
+```bash
+schemaspy diff old.db new.db
+```
+
+Added tables print in green, removed tables in red, and column changes show `old_type → new_type` in yellow.
+
+---
+
+### Feature 3 — Natural Language to SQL (`schemaspy query`)
+
+Ask a question in plain English and get valid SQLite SQL back, streamed live from Claude Haiku. Optionally execute the query immediately and display results in a Rich table.
+
+```bash
+# Generate SQL only (requires ANTHROPIC_API_KEY)
+export ANTHROPIC_API_KEY=sk-ant-...
+schemaspy query myapp.db "How many orders were placed per user last month?"
+
+# Generate AND execute, capping results at 20 rows
+schemaspy query myapp.db "Top 5 products by revenue" --execute --limit 20
+```
+
+---
+
 # schemaspy
 
 **SQLite schema explorer with AI documentation generation, semantic table search, and async Rich dashboard.**
