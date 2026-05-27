@@ -101,7 +101,7 @@ def cmd_inspect(args: argparse.Namespace) -> None:
 
     # ── Export ───────────────────────────────────────────────────────────────
     if args.format:
-        from schemaspy.exporter import export_html, export_json, export_markdown
+        from schemaspy.exporter import export_html, export_json, export_markdown, export_mermaid
 
         fmt = args.format.lower()
         if fmt == "json":
@@ -110,6 +110,8 @@ def cmd_inspect(args: argparse.Namespace) -> None:
             output = export_markdown(report)
         elif fmt == "html":
             output = export_html(report)
+        elif fmt == "mermaid":
+            output = export_mermaid(report)
         else:
             console.print(f"[red]Unknown format:[/red] {fmt}")
             sys.exit(1)
@@ -119,7 +121,9 @@ def cmd_inspect(args: argparse.Namespace) -> None:
                 fh.write(output)
             console.print(f"[green]✓[/green] Exported to [cyan]{args.output}[/cyan]")
         else:
-            console.print(output)
+            sys.stdout.write(output)
+            if not output.endswith("\n"):
+                sys.stdout.write("\n")
         return
 
     # ── Rich summary table ───────────────────────────────────────────────────
@@ -389,6 +393,184 @@ def cmd_diff(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sub-command: health
+# ---------------------------------------------------------------------------
+
+def cmd_health(args: argparse.Namespace) -> None:
+    """Score the schema health across multiple dimensions and display a breakdown."""
+    from schemaspy.analyzer import analyze_schema
+    from schemaspy.health import score_schema
+
+    _require_db(args.db)
+
+    with console.status("[cyan]Analyzing schema…[/cyan]"):
+        report = analyze_schema(args.db)
+        health = score_schema(report)
+
+    # ── Grade badge ──────────────────────────────────────────────────────────
+    grade_style = {
+        "A": "bold green",
+        "B": "bold cyan",
+        "C": "bold yellow",
+        "D": "bold red",
+        "F": "bold red",
+    }.get(health.grade, "bold white")
+
+    score_text = Text(f"{health.overall}/100  Grade: {health.grade}", style=grade_style)
+
+    # ── Category breakdown table ──────────────────────────────────────────────
+    tbl = Table(
+        title=f"[bold]Schema Health: {args.db}[/bold]",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    tbl.add_column("Category", style="cyan", no_wrap=True)
+    tbl.add_column("Score", justify="right")
+    tbl.add_column("Weight", justify="right", style="dim")
+    tbl.add_column("Details")
+
+    for cat in health.categories:
+        if cat.score >= 90:
+            bar_style = "green"
+        elif cat.score >= 65:
+            bar_style = "yellow"
+        else:
+            bar_style = "red"
+
+        filled = int(cat.score / 10)  # 0-10 blocks
+        bar = "█" * filled + "░" * (10 - filled)
+
+        tbl.add_row(
+            cat.name,
+            Text(f"{bar} {cat.score:3d}", style=bar_style),
+            str(cat.max_score),
+            "\n".join(cat.details) if cat.details else "",
+        )
+
+    console.print(tbl)
+    console.print()
+    console.print(
+        Panel(score_text, title="[bold]Overall Health Score[/bold]", border_style=grade_style)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sub-command: analyze-query
+# ---------------------------------------------------------------------------
+
+def cmd_analyze_query(args: argparse.Namespace) -> None:
+    """Run EXPLAIN QUERY PLAN on a SQL statement and show index usage and suggestions."""
+    from schemaspy.query_analyzer import analyze_query
+
+    _require_db(args.db)
+
+    with console.status("[cyan]Running EXPLAIN QUERY PLAN…[/cyan]"):
+        analysis = analyze_query(args.db, args.sql)
+
+    if analysis.error:
+        console.print(f"[red]SQL Error:[/red] {analysis.error}")
+        sys.exit(1)
+
+    # ── Query plan steps table ────────────────────────────────────────────────
+    plan_tbl = Table(
+        title="[bold]EXPLAIN QUERY PLAN[/bold]",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    plan_tbl.add_column("ID", justify="right", style="dim")
+    plan_tbl.add_column("Parent", justify="right", style="dim")
+    plan_tbl.add_column("Detail")
+    plan_tbl.add_column("Index Used", style="cyan")
+    plan_tbl.add_column("Type", justify="center")
+
+    for step in analysis.plan_steps:
+        if step.uses_index:
+            step_type = Text("INDEX SCAN", style="green")
+        elif step.is_full_scan:
+            step_type = Text("FULL SCAN", style="red")
+        else:
+            step_type = Text("OTHER", style="dim")
+
+        plan_tbl.add_row(
+            str(step.id),
+            str(step.parent),
+            step.detail,
+            step.index_name or "[dim]—[/dim]",
+            step_type,
+        )
+
+    console.print(plan_tbl)
+
+    # ── Summary stats ─────────────────────────────────────────────────────────
+    console.print()
+    console.print(
+        f"[bold]Steps:[/bold] {len(analysis.plan_steps)}  "
+        f"[green]Indexed scans:[/green] {len(analysis.indexed_scans)}  "
+        f"[red]Full scans:[/red] {len(analysis.full_scans)}"
+    )
+
+    # ── Suggestions ───────────────────────────────────────────────────────────
+    if analysis.suggestions:
+        console.print()
+        sug_tbl = Table(
+            title="[bold yellow]Index Suggestions[/bold yellow]",
+            show_header=False,
+            box=None,
+            padding=(0, 1),
+        )
+        sug_tbl.add_column("", style="yellow")
+        for i, suggestion in enumerate(analysis.suggestions, 1):
+            sug_tbl.add_row(f"[dim]{i}.[/dim] {suggestion}")
+        console.print(
+            Panel(sug_tbl, border_style="yellow", title="[bold yellow]Suggestions[/bold yellow]")
+        )
+    else:
+        console.print()
+        console.print("[green]✓ No index suggestions — query plan looks efficient.[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Sub-command: export
+# ---------------------------------------------------------------------------
+
+def cmd_export(args: argparse.Namespace) -> None:
+    """Export the schema in a specified format: sql, mermaid, json, markdown, or html."""
+    from schemaspy.analyzer import analyze_schema
+    from schemaspy.exporter import export_html, export_json, export_markdown, export_mermaid, export_sql
+
+    _require_db(args.db)
+
+    with console.status("[cyan]Analyzing schema…[/cyan]"):
+        report = analyze_schema(args.db)
+
+    fmt = args.format.lower()
+    if fmt == "sql":
+        output = export_sql(report)
+    elif fmt == "json":
+        output = export_json(report)
+    elif fmt == "markdown":
+        output = export_markdown(report)
+    elif fmt == "html":
+        output = export_html(report)
+    elif fmt == "mermaid":
+        output = export_mermaid(report)
+    else:
+        console.print(f"[red]Unknown format:[/red] {fmt}")
+        sys.exit(1)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(output)
+        console.print(f"[green]✓[/green] Exported [bold]{fmt}[/bold] to [cyan]{args.output}[/cyan]")
+    else:
+        # Write raw text without Rich markup interpretation so brackets in SQL
+        # DDL / JSON / Mermaid are not treated as style tags.
+        sys.stdout.write(output)
+        if not output.endswith("\n"):
+            sys.stdout.write("\n")
+
+
+# ---------------------------------------------------------------------------
 # Sub-command: query (natural language → SQL via Claude)
 # ---------------------------------------------------------------------------
 
@@ -500,7 +682,7 @@ def main() -> None:
         prog="schemaspy",
         description="SQLite schema explorer with AI documentation and semantic search",
     )
-    parser.add_argument("--version", action="version", version="schemaspy 1.3.0")
+    parser.add_argument("--version", action="version", version="schemaspy 1.4.0")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -509,7 +691,7 @@ def main() -> None:
     p_inspect.add_argument("db", metavar="DB", help="Path to SQLite database file")
     p_inspect.add_argument("--ai", action="store_true", help="Generate AI documentation")
     p_inspect.add_argument(
-        "--format", choices=["json", "markdown", "html"], help="Export format"
+        "--format", choices=["json", "markdown", "html", "mermaid"], help="Export format"
     )
     p_inspect.add_argument("--output", "-o", metavar="FILE", help="Output file path")
 
@@ -555,6 +737,34 @@ def main() -> None:
         help="Append LIMIT N to the generated query before executing",
     )
 
+    # health
+    p_health = sub.add_parser(
+        "health", help="Score schema health across multiple quality dimensions"
+    )
+    p_health.add_argument("db", metavar="DB", help="Path to SQLite database file")
+
+    # analyze-query
+    p_aq = sub.add_parser(
+        "analyze-query",
+        help="Run EXPLAIN QUERY PLAN on a SQL statement and show index usage",
+    )
+    p_aq.add_argument("db", metavar="DB", help="Path to SQLite database file")
+    p_aq.add_argument("sql", metavar="SQL", help="SQL statement to analyze")
+
+    # export
+    p_export = sub.add_parser(
+        "export", help="Export the schema in a specified format (sql, mermaid, json, markdown, html)"
+    )
+    p_export.add_argument("db", metavar="DB", help="Path to SQLite database file")
+    p_export.add_argument(
+        "--format",
+        "-f",
+        choices=["sql", "mermaid", "json", "markdown", "html"],
+        required=True,
+        help="Output format",
+    )
+    p_export.add_argument("--output", "-o", metavar="FILE", help="Output file path")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -564,6 +774,9 @@ def main() -> None:
         "profile": cmd_profile,
         "diff": cmd_diff,
         "query": cmd_query,
+        "health": cmd_health,
+        "analyze-query": cmd_analyze_query,
+        "export": cmd_export,
     }
     dispatch[args.command](args)
 

@@ -1,3 +1,48 @@
+## What's New in v1.4
+
+### Feature 1 — Schema Health Score (`schemaspy health`)
+
+Get an instant 0–100 health score for your database schema with a letter grade (A–F) and a per-category breakdown table. Six weighted dimensions are evaluated: primary keys, FK index coverage, naming conventions, empty tables, column type declarations, and index coverage on large tables.
+
+```bash
+schemaspy health myapp.db
+```
+
+Output shows a progress-bar-style score for each category, the contributing weight, and specific details about what passed or needs attention. The overall score and grade are printed in a colour-coded summary panel.
+
+---
+
+### Feature 2 — Query Plan Analyzer (`schemaspy analyze-query`)
+
+Pass any SQL statement and get a formatted EXPLAIN QUERY PLAN table showing each plan step, whether an index was used, and which index — plus actionable `CREATE INDEX` suggestions for any full-table scans detected.
+
+```bash
+schemaspy analyze-query myapp.db "SELECT * FROM orders WHERE customer_id = 42"
+```
+
+Full table scans are highlighted in red, indexed scans in green. Each suggestion includes the exact `CREATE INDEX` DDL you can run to fix the issue.
+
+---
+
+### Feature 3 — Dedicated Schema Export (`schemaspy export`)
+
+A first-class `export` command that supports five formats including the new **SQL DDL** format, which emits `DROP TABLE IF EXISTS` + `CREATE TABLE` + `CREATE INDEX` statements — a runnable script to recreate the schema from scratch.
+
+```bash
+# Recreatable SQL DDL (new!)
+schemaspy export myapp.db --format sql --output schema.sql
+
+# Mermaid ER diagram
+schemaspy export myapp.db --format mermaid --output schema.mmd
+
+# JSON, Markdown, or self-contained HTML
+schemaspy export myapp.db --format json --output schema.json
+schemaspy export myapp.db --format markdown --output SCHEMA.md
+schemaspy export myapp.db --format html --output report.html
+```
+
+---
+
 ## What's New in v1.3
 
 ### Feature 1 — Data Profiling (`schemaspy profile`)
@@ -219,6 +264,98 @@ $ schemaspy issues legacy.db --ai
 
 ---
 
+### `schemaspy health <db>`
+
+Score the schema health across six weighted quality dimensions and display a breakdown with an overall letter grade (A–F).
+
+**Scored dimensions:**
+
+| Category | Weight | What is checked |
+|---|---|---|
+| Primary Keys | 25 | Every table has a PK column |
+| FK Indexes | 20 | Every FK column is indexed |
+| Naming Conventions | 15 | All identifiers use snake_case |
+| Column Types | 15 | All columns have explicit type declarations |
+| Index Coverage | 15 | Large tables (≥100 rows) have at least one explicit index |
+| Non-empty Tables | 10 | No vestigial empty tables |
+
+**Example:**
+
+```
+$ schemaspy health legacy.db
+
+                 Schema Health: legacy.db
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Category             ┃         Score ┃ Weight ┃ Details                   ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ Primary Keys         │ ██████████ 100 │     25 │ All tables have a PK      │
+│ FK Indexes           │ ███░░░░░░░  33 │     20 │ Unindexed: orders.user_id │
+│ Naming Conventions   │ ██████████ 100 │     15 │ All identifiers snake_case │
+│ Column Types         │ ██████████ 100 │     15 │ All columns typed         │
+│ Index Coverage       │ █████░░░░░  50 │     15 │ Under-indexed: orders     │
+│ Non-empty Tables     │ ██████████ 100 │     10 │ All tables contain data   │
+└──────────────────────┴───────────────┴────────┴───────────────────────────┘
+
+╭─── Overall Health Score ────╮
+│  78/100  Grade: C           │
+╰─────────────────────────────╯
+```
+
+---
+
+### `schemaspy analyze-query <db> "<sql>"`
+
+Run `EXPLAIN QUERY PLAN` on any SQL statement and get a formatted table of plan steps (with index-use highlighted), a summary of full scans vs indexed scans, and specific `CREATE INDEX` DDL suggestions.
+
+**Example:**
+
+```
+$ schemaspy analyze-query shop.db "SELECT * FROM orders WHERE customer_id = 1"
+
+            EXPLAIN QUERY PLAN
+┏━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━┓
+┃ ID ┃ Parent ┃ Detail                        ┃ Index Used ┃ Type      ┃
+┡━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━┩
+│  2 │      0 │ SCAN orders                   │ —          │ FULL SCAN │
+└────┴────────┴───────────────────────────────┴────────────┴───────────┘
+
+Steps: 1  Indexed scans: 0  Full scans: 1
+
+╭─── Suggestions ────────────────────────────────────────────────────────────╮
+│ 1. Full table scan on 'orders'. Consider:                                  │
+│    CREATE INDEX idx_orders_customer_id ON orders(customer_id);             │
+╰────────────────────────────────────────────────────────────────────────────╯
+```
+
+---
+
+### `schemaspy export <db> --format <fmt>`
+
+Dedicated export command supporting five output formats, including **SQL DDL** which generates a runnable `CREATE TABLE` + `CREATE INDEX` script to recreate the schema from scratch.
+
+| Format | Description |
+|---|---|
+| `sql` | SQL DDL — DROP/CREATE TABLE + CREATE INDEX statements |
+| `mermaid` | Mermaid ER diagram (paste into any Mermaid-compatible renderer) |
+| `json` | Machine-readable full schema report |
+| `markdown` | Documentation-friendly Markdown |
+| `html` | Self-contained dark-theme HTML report |
+
+**Example:**
+
+```bash
+# Recreatable SQL DDL
+schemaspy export myapp.db --format sql --output schema.sql
+
+# ER diagram for documentation
+schemaspy export myapp.db --format mermaid --output schema.mmd
+
+# Print to stdout (omit --output)
+schemaspy export myapp.db --format json
+```
+
+---
+
 ## Export Formats
 
 ```bash
@@ -252,12 +389,16 @@ schemaspy inspect myapp.db --format html --output schema.html
 
 ```
 schemaspy/
-├── models.py      — Dataclasses: TableInfo, ColumnInfo, SchemaReport, SchemaIssue
-├── analyzer.py    — SQLite introspection via stdlib sqlite3 + async TaskGroup
-├── semantic.py    — TF-IDF cosine similarity (pure Python, stdlib only)
-├── ai_doc.py      — Streaming Claude Haiku documentation generator
-├── exporter.py    — Markdown / JSON / HTML rendering
-└── cli.py         — Argparse CLI with Rich Live output
+├── models.py         — Dataclasses: TableInfo, ColumnInfo, SchemaReport, SchemaIssue
+├── analyzer.py       — SQLite introspection via stdlib sqlite3 + async TaskGroup
+├── semantic.py       — TF-IDF cosine similarity (pure Python, stdlib only)
+├── ai_doc.py         — Streaming Claude Haiku documentation generator
+├── exporter.py       — Markdown / JSON / HTML / Mermaid / SQL DDL rendering
+├── health.py         — Schema health scoring (0-100, A-F grade, 6 weighted categories)
+├── query_analyzer.py — EXPLAIN QUERY PLAN runner with index suggestion engine
+├── profiler.py       — Column-level data profiling (null %, distinct, min/max, samples)
+├── differ.py         — Schema diff: added/removed tables, column changes, type changes
+└── cli.py            — Argparse CLI with Rich Live output
 ```
 
 ---
